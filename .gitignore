@@ -1,0 +1,10 @@
+﻿.claude
+bin/Debug
+bin/Release
+obj/Debug
+obj/Release
+obj
+run.err
+run.log
+run-obsidian.err
+run-obsidian.log
