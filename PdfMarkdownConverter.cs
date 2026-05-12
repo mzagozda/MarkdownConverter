@@ -40,32 +40,62 @@ public sealed class PdfMarkdownConverter : IFileToMarkdownConverter, IDisposable
             MarkdownOutput.WriteAtomic(displaySourcePath, outputPath, output =>
             {
                 using var pdf = PdfDocument.Open(sourcePath);
-                int pageNumber = 0;
-                foreach (PdfPage page in pdf.GetPages())
+
+                int totalPages = pdf.NumberOfPages;
+                int successfulPages = 0;
+                int failedPages = 0;
+                Exception? lastPageException = null;
+
+                // Iterate by index so we can isolate per-page failures. Common cases
+                // (malformed font dictionaries, broken page resources) throw inside
+                // pdf.GetPage(N); without this, one bad page would forfeit the whole
+                // document. We still produce a .ex if NO page extracts successfully.
+                for (int pageNumber = 1; pageNumber <= totalPages; pageNumber++)
                 {
-                    pageNumber++;
-
-                    string text = ExtractTextLayer(page);
-                    bool useOcr = CountSignificantChars(text) < MinExtractedCharsToTrustTextLayer;
-
-                    if (useOcr)
+                    string text;
+                    try
                     {
-                        TesseractEngine? engine = GetOrInitOcrEngine();
-                        if (engine is not null)
+                        PdfPage page = pdf.GetPage(pageNumber);
+                        text = ExtractTextLayer(page);
+                        bool useOcr = CountSignificantChars(text) < MinExtractedCharsToTrustTextLayer;
+
+                        if (useOcr)
                         {
-                            docReader ??= TryOpenDocReader(sourcePath);
-                            if (docReader is not null)
+                            TesseractEngine? engine = GetOrInitOcrEngine();
+                            if (engine is not null)
                             {
-                                string ocrText = OcrPage(docReader, pageNumber - 1, engine);
-                                if (!string.IsNullOrWhiteSpace(ocrText))
-                                    text = ocrText;
+                                docReader ??= TryOpenDocReader(sourcePath);
+                                if (docReader is not null)
+                                {
+                                    string ocrText = OcrPage(docReader, pageNumber - 1, engine);
+                                    if (!string.IsNullOrWhiteSpace(ocrText))
+                                        text = ocrText;
+                                }
                             }
                         }
+
+                        successfulPages++;
+                    }
+                    catch (Exception ex)
+                    {
+                        failedPages++;
+                        lastPageException = ex;
+                        Console.Error.WriteLine(
+                            $"[page-fail] {displaySourcePath} page {pageNumber}: {ex.GetType().Name}: {ex.Message}");
+                        text = $"<!-- page extraction failed: {ex.GetType().Name}: {EscapeForComment(ex.Message)} -->";
                     }
 
                     WritePage(output, pageNumber, text);
                     output.Flush();
                 }
+
+                // If we couldn't extract a single page, surface the failure as a document
+                // error (produces a .ex) instead of leaving a Markdown file of only error
+                // markers behind. Encrypted and truly-corrupt PDFs hit this path.
+                if (totalPages > 0 && successfulPages == 0 && lastPageException is not null)
+                    throw new InvalidOperationException(
+                        $"All {totalPages} page(s) failed to extract. Last error: {lastPageException.Message}",
+                        lastPageException);
             });
         }
         finally
@@ -73,6 +103,9 @@ public sealed class PdfMarkdownConverter : IFileToMarkdownConverter, IDisposable
             docReader?.Dispose();
         }
     }
+
+    private static string EscapeForComment(string s) =>
+        s.Replace("--", "- -").Replace("\r", " ").Replace("\n", " ");
 
     public void Dispose()
     {

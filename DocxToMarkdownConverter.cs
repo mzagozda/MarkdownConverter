@@ -11,7 +11,11 @@ public sealed class DocxToMarkdownConverter : IFileToMarkdownConverter
     {
         MarkdownOutput.WriteAtomic(displaySourcePath, outputPath, output =>
         {
-            using var doc = WordprocessingDocument.Open(sourcePath, isEditable: false);
+            // Use a FileStream with permissive sharing so we can still read files
+            // that the user has open in Word (Word grants FileShare.Read on its lock).
+            using var fs = new FileStream(sourcePath, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var doc = WordprocessingDocument.Open(fs, isEditable: false);
             MainDocumentPart? main = doc.MainDocumentPart;
             Body? body = main?.Document?.Body;
             if (main is null || body is null) return;

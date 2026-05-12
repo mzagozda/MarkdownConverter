@@ -12,7 +12,9 @@ public sealed class PptxToMarkdownConverter : IFileToMarkdownConverter
     {
         MarkdownOutput.WriteAtomic(displaySourcePath, outputPath, output =>
         {
-            using var doc = PresentationDocument.Open(sourcePath, isEditable: false);
+            using var fs = new FileStream(sourcePath, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var doc = PresentationDocument.Open(fs, isEditable: false);
             PresentationPart? presPart = doc.PresentationPart;
             SlideIdList? slideIds = presPart?.Presentation?.SlideIdList;
             if (presPart is null || slideIds is null) return;

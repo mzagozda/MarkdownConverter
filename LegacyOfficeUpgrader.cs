@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.RegularExpressions;
 
 namespace Converter;
 
@@ -8,6 +9,14 @@ namespace Converter;
 public static class LegacyOfficeUpgrader
 {
     private const int ProcessTimeoutMs = 120_000;
+    private const int VersionProbeTimeoutMs = 10_000;
+
+    // Minimum LibreOffice release we support. 7.6 was the final 7.x line and is the
+    // earliest version where `--convert-to docx/xlsx/pptx` is reliable for the binary
+    // legacy formats we care about. Earlier releases work for many documents but have
+    // known filter regressions; we surface a warning rather than silently using them.
+    public static readonly Version MinimumLibreOfficeVersion = new(7, 6, 0);
+
     private static string? _resolvedSofficePath;
     private static bool _searchAttempted;
 
@@ -73,20 +82,137 @@ public static class LegacyOfficeUpgrader
         }
     }
 
-    private static string ResolveSofficeOrThrow()
+    public enum ProbeStatus
+    {
+        Ok,
+        NotFound,
+        VersionUnknown,
+        TooOld
+    }
+
+    public sealed record ProbeResult(ProbeStatus Status, string? Path, Version? Version, string Message);
+
+    // Examine the local LibreOffice install once and report what we found. This is
+    // safe to call before any file is processed and never throws.
+    public static ProbeResult Probe()
+    {
+        string? path = TryResolveSoffice();
+        if (path is null)
+        {
+            return new ProbeResult(ProbeStatus.NotFound, null, null,
+                $"LibreOffice (soffice) not found on PATH or in standard install locations. " +
+                $"Install version {MinimumLibreOfficeVersion} or newer to enable legacy .doc / .xls / .ppt conversion.");
+        }
+
+        Version? version = ReadSofficeVersion(path);
+
+        if (version is null)
+        {
+            return new ProbeResult(ProbeStatus.VersionUnknown, path, null,
+                $"LibreOffice found at {path} but `soffice --version` did not return a parseable version string. " +
+                $"Minimum supported version is {MinimumLibreOfficeVersion}.");
+        }
+
+        if (version < MinimumLibreOfficeVersion)
+        {
+            return new ProbeResult(ProbeStatus.TooOld, path, version,
+                $"LibreOffice {version} at {path} is older than the supported minimum ({MinimumLibreOfficeVersion}). " +
+                $"Legacy .doc / .xls / .ppt conversion may fail or produce incorrect output. Please upgrade.");
+        }
+
+        return new ProbeResult(ProbeStatus.Ok, path, version,
+            $"LibreOffice {version} detected at {path}.");
+    }
+
+    private static string? TryResolveSoffice()
     {
         if (!_searchAttempted)
         {
             _resolvedSofficePath = LocateSoffice();
             _searchAttempted = true;
         }
-        if (_resolvedSofficePath is null)
+        return _resolvedSofficePath;
+    }
+
+    private static string ResolveSofficeOrThrow()
+    {
+        string? path = TryResolveSoffice();
+        if (path is null)
         {
             throw new InvalidOperationException(
-                "LibreOffice (soffice) was not found. Install LibreOffice or put soffice on PATH " +
-                "to enable conversion of legacy .doc / .xls / .ppt files.");
+                $"LibreOffice (soffice) was not found. Install LibreOffice {MinimumLibreOfficeVersion} or newer, " +
+                $"or put `soffice` on PATH, to enable conversion of legacy .doc / .xls / .ppt files.");
         }
-        return _resolvedSofficePath;
+        return path;
+    }
+
+    private static Version? ReadSofficeVersion(string sofficePath)
+    {
+        // On Windows, `soffice --version` does not reliably print to stdout — the .exe
+        // detaches into the GUI subsystem and the .com console-wrapper exits with code 53
+        // on `--version`. The PE file's VersionInfo, however, carries the LibreOffice
+        // version reliably for any Windows install, so we try it first.
+        Version? fromMetadata = TryReadVersionFromFileMetadata(sofficePath);
+        if (fromMetadata is not null) return fromMetadata;
+
+        return TryReadVersionFromCommandLine(sofficePath);
+    }
+
+    private static Version? TryReadVersionFromFileMetadata(string sofficePath)
+    {
+        try
+        {
+            FileVersionInfo info = FileVersionInfo.GetVersionInfo(sofficePath);
+            string? raw = info.ProductVersion ?? info.FileVersion;
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+            Match m = Regex.Match(raw, @"(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?");
+            if (!m.Success) return null;
+            return BuildVersion(m);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static Version? TryReadVersionFromCommandLine(string sofficePath)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = sofficePath,
+            ArgumentList = { "--version", "--headless", "--norestore", "--nologo", "--nofirststartwizard" },
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        Process? proc;
+        try { proc = Process.Start(psi); }
+        catch { return null; }
+        if (proc is null) return null;
+
+        using (proc)
+        {
+            if (!proc.WaitForExit(VersionProbeTimeoutMs))
+            {
+                try { proc.Kill(entireProcessTree: true); } catch { }
+                return null;
+            }
+
+            string output = proc.StandardOutput.ReadToEnd() + "\n" + proc.StandardError.ReadToEnd();
+            Match m = Regex.Match(output, @"LibreOffice\s+(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?");
+            return m.Success ? BuildVersion(m) : null;
+        }
+    }
+
+    private static Version BuildVersion(Match m)
+    {
+        int major = int.Parse(m.Groups[1].Value);
+        int minor = int.Parse(m.Groups[2].Value);
+        int build = m.Groups[3].Success ? int.Parse(m.Groups[3].Value) : 0;
+        int revision = m.Groups[4].Success ? int.Parse(m.Groups[4].Value) : 0;
+        return new Version(major, minor, build, revision);
     }
 
     private static string? LocateSoffice()

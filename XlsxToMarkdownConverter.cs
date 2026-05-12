@@ -10,7 +10,9 @@ public sealed class XlsxToMarkdownConverter : IFileToMarkdownConverter
     {
         MarkdownOutput.WriteAtomic(displaySourcePath, outputPath, output =>
         {
-            using var doc = SpreadsheetDocument.Open(sourcePath, isEditable: false);
+            using var fs = new FileStream(sourcePath, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var doc = SpreadsheetDocument.Open(fs, isEditable: false);
             WorkbookPart? wbPart = doc.WorkbookPart;
             Sheets? sheets = wbPart?.Workbook?.Sheets;
             if (wbPart is null || sheets is null) return;

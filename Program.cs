@@ -70,6 +70,8 @@ public static class Program
             return 1;
         }
 
+        ReportLibreOfficeStatus();
+
         using var pdfConverter = new PdfMarkdownConverter(tessdataPath, languages);
         var docxConverter = new DocxToMarkdownConverter();
         var xlsxConverter = new XlsxToMarkdownConverter();
@@ -168,6 +170,13 @@ public static class Program
         };
         foreach (string path in Directory.EnumerateFiles(root, "*", options))
         {
+            string name = Path.GetFileName(path);
+
+            // Microsoft Office writes a "~$<truncated-name>" owner-lock file next to a
+            // document that's open in Word/Excel/PowerPoint. These are tiny metadata
+            // files, not real Office packages, and trying to parse them always fails.
+            if (name.StartsWith("~$", StringComparison.Ordinal)) continue;
+
             string ext = Path.GetExtension(path).ToLowerInvariant();
             if (Array.IndexOf(SupportedExtensions, ext) >= 0)
                 yield return path;
@@ -183,6 +192,22 @@ public static class Program
         if (srcTime - mdTime > SourceNewerThreshold) return false;
 
         return policy == ExistingPolicy.Skip;
+    }
+
+    private static void ReportLibreOfficeStatus()
+    {
+        LegacyOfficeUpgrader.ProbeResult probe = LegacyOfficeUpgrader.Probe();
+        switch (probe.Status)
+        {
+            case LegacyOfficeUpgrader.ProbeStatus.Ok:
+                Console.WriteLine(probe.Message);
+                break;
+            case LegacyOfficeUpgrader.ProbeStatus.NotFound:
+            case LegacyOfficeUpgrader.ProbeStatus.VersionUnknown:
+            case LegacyOfficeUpgrader.ProbeStatus.TooOld:
+                Console.Error.WriteLine($"[warn] {probe.Message}");
+                break;
+        }
     }
 
     // Set of "C:/path/to/file" (no extension) for every Office source in the run.
