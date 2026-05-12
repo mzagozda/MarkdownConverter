@@ -7,11 +7,12 @@ using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.PixelFormats;
 using Tesseract;
 using UglyToad.PdfPig;
+using UglyToad.PdfPig.Content;
 using PdfPage = UglyToad.PdfPig.Content.Page;
 
 namespace Converter;
 
-public sealed class PdfMarkdownConverter : IDisposable
+public sealed class PdfMarkdownConverter : IFileToMarkdownConverter, IDisposable
 {
     private const int MinExtractedCharsToTrustTextLayer = 16;
     private const int OcrRenderWidth = 1700;
@@ -31,18 +32,14 @@ public sealed class PdfMarkdownConverter : IDisposable
         _languages = languages;
     }
 
-    public void Convert(string pdfPath, string mdPath)
+    public void Convert(string sourcePath, string displaySourcePath, string outputPath)
     {
-        string tmpPath = mdPath + ".tmp";
-        string exPath = pdfPath + ".ex";
-
         IDocReader? docReader = null;
-
         try
         {
-            using (var output = new StreamWriter(tmpPath, append: false, new UTF8Encoding(false)))
-            using (var pdf = PdfDocument.Open(pdfPath))
+            MarkdownOutput.WriteAtomic(displaySourcePath, outputPath, output =>
             {
+                using var pdf = PdfDocument.Open(sourcePath);
                 int pageNumber = 0;
                 foreach (PdfPage page in pdf.GetPages())
                 {
@@ -56,7 +53,7 @@ public sealed class PdfMarkdownConverter : IDisposable
                         TesseractEngine? engine = GetOrInitOcrEngine();
                         if (engine is not null)
                         {
-                            docReader ??= TryOpenDocReader(pdfPath);
+                            docReader ??= TryOpenDocReader(sourcePath);
                             if (docReader is not null)
                             {
                                 string ocrText = OcrPage(docReader, pageNumber - 1, engine);
@@ -69,16 +66,7 @@ public sealed class PdfMarkdownConverter : IDisposable
                     WritePage(output, pageNumber, text);
                     output.Flush();
                 }
-            }
-
-            if (File.Exists(mdPath)) File.Delete(mdPath);
-            File.Move(tmpPath, mdPath);
-            TryDelete(exPath);
-        }
-        catch (Exception ex)
-        {
-            WriteErrorFile(exPath, tmpPath, pdfPath, ex);
-            throw;
+            });
         }
         finally
         {
@@ -92,11 +80,81 @@ public sealed class PdfMarkdownConverter : IDisposable
         _ocrEngine = null;
     }
 
+    // Marker inserted between words that we can deterministically say come from
+    // different page regions (different blocks, columns, or table cells). Surrounding
+    // spaces keep the marker as its own visual token in the resulting Markdown.
+    private const string RegionBreakSeparator = " - ";
+
     private static string ExtractTextLayer(PdfPage page)
     {
-        // PdfPig's page.Text returns the page's text content stream; embedded raster images are not included.
-        // This satisfies "skip any images that are mixed with textual content".
-        return page.Text ?? string.Empty;
+        // Embedded raster images are not part of the word stream, so this satisfies
+        // "skip any images that are mixed with textual content" by construction.
+        var words = page.GetWords().ToList();
+        if (words.Count == 0) return string.Empty;
+
+        double lineHeight = ComputeMedianHeight(words);
+        if (lineHeight <= 0) lineHeight = 10.0;
+
+        var sb = new StringBuilder(EstimateCapacity(words));
+        sb.Append(words[0].Text);
+        for (int i = 1; i < words.Count; i++)
+        {
+            sb.Append(ChooseSeparator(words[i - 1], words[i], lineHeight));
+            sb.Append(words[i].Text);
+        }
+        return sb.ToString();
+    }
+
+    private static double ComputeMedianHeight(List<Word> words)
+    {
+        var heights = new List<double>(words.Count);
+        foreach (var w in words)
+        {
+            double h = w.BoundingBox.Height;
+            if (h > 0) heights.Add(h);
+        }
+        if (heights.Count == 0) return 0;
+        heights.Sort();
+        return heights[heights.Count / 2];
+    }
+
+    private static int EstimateCapacity(List<Word> words)
+    {
+        int sum = 0;
+        foreach (var w in words) sum += w.Text.Length + 1;
+        return sum;
+    }
+
+    // Returns the separator to place between `prev` and `curr` based on their geometry.
+    // The defaults are conservative: only emit RegionBreakSeparator when the layout
+    // signal is unambiguous, so legitimate in-paragraph line wraps stay attached.
+    private static string ChooseSeparator(Word prev, Word curr, double lineHeight)
+    {
+        var pb = prev.BoundingBox;
+        var cb = curr.BoundingBox;
+
+        double sameLineTolerance = lineHeight * 0.5;
+        bool sameLine = Math.Abs(pb.Bottom - cb.Bottom) <= sameLineTolerance;
+
+        if (sameLine)
+        {
+            double hGap = cb.Left - pb.Right;
+            // Backward on the same line — reading order looped, distinct region.
+            if (hGap < -lineHeight * 0.5) return RegionBreakSeparator;
+            // Same line, very wide gap — column or table-cell boundary.
+            if (hGap > lineHeight * 5.0) return RegionBreakSeparator;
+            return " ";
+        }
+
+        // Next word sits above the previous one — reading order jumped to a new region.
+        if (cb.Bottom > pb.Top) return RegionBreakSeparator;
+
+        // Vertical gap to the next line; large gaps indicate a block/paragraph break.
+        double vGap = pb.Bottom - cb.Top;
+        if (vGap > lineHeight * 1.8) return RegionBreakSeparator;
+
+        // Otherwise: normal next-line wrap within the same paragraph.
+        return " ";
     }
 
     private static int CountSignificantChars(string text)
@@ -155,7 +213,28 @@ public sealed class PdfMarkdownConverter : IDisposable
 
         using var pix = Pix.LoadFromMemory(png);
         using var result = engine.Process(pix);
-        return result.GetText() ?? string.Empty;
+        return ExtractOcrTextByBlock(result);
+    }
+
+    // Tesseract already segments output into blocks; join distinct blocks with the
+    // region-break separator while leaving intra-block content alone, so line-broken
+    // words within a paragraph stay attached.
+    private static string ExtractOcrTextByBlock(Tesseract.Page result)
+    {
+        var sb = new StringBuilder();
+        using ResultIterator iter = result.GetIterator();
+        iter.Begin();
+        bool firstBlock = true;
+        do
+        {
+            string blockText = iter.GetText(PageIteratorLevel.Block) ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(blockText)) continue;
+            if (!firstBlock) sb.Append(RegionBreakSeparator);
+            sb.Append(blockText.Trim());
+            firstBlock = false;
+        } while (iter.Next(PageIteratorLevel.Block));
+
+        return sb.Length == 0 ? (result.GetText() ?? string.Empty) : sb.ToString();
     }
 
     private static byte[] EncodeBgraAsPng(byte[] bgra, int width, int height)
@@ -174,47 +253,4 @@ public sealed class PdfMarkdownConverter : IDisposable
         output.WriteLine();
     }
 
-    private static void TryDelete(string path)
-    {
-        try { if (File.Exists(path)) File.Delete(path); }
-        catch { /* swallow cleanup errors */ }
-    }
-
-    private static void WriteErrorFile(string exPath, string tmpPath, string pdfPath, Exception ex)
-    {
-        try
-        {
-            // Append the error block to whatever partial output we captured, then rename.
-            // StreamWriter(append: true) creates the file if it doesn't exist, which covers
-            // the case where Convert threw before any page was written.
-            using (var writer = new StreamWriter(tmpPath, append: true, new UTF8Encoding(false)))
-            {
-                writer.WriteLine();
-                writer.WriteLine("<!-- ===== CONVERSION FAILED ===== -->");
-                writer.WriteLine();
-                writer.WriteLine("# Conversion failed");
-                writer.WriteLine();
-                writer.WriteLine($"- Source:    `{pdfPath}`");
-                writer.WriteLine($"- Timestamp: {DateTime.UtcNow:O}");
-                writer.WriteLine($"- Type:      `{ex.GetType().FullName}`");
-                writer.WriteLine($"- Message:   {ex.Message}");
-                writer.WriteLine();
-                writer.WriteLine("## Details");
-                writer.WriteLine();
-                writer.WriteLine("```");
-                writer.WriteLine(ex.ToString());
-                writer.WriteLine("```");
-            }
-
-            if (File.Exists(exPath)) File.Delete(exPath);
-            File.Move(tmpPath, exPath);
-        }
-        catch
-        {
-            // Last-ditch: try to leave at least a minimal error file so the failure is visible.
-            try { File.WriteAllText(exPath, $"Source: {pdfPath}{Environment.NewLine}{ex}", new UTF8Encoding(false)); }
-            catch { /* give up */ }
-            TryDelete(tmpPath);
-        }
-    }
 }
