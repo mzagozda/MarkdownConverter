@@ -16,7 +16,8 @@ public static class Program
     {
         ".pdf",
         ".docx", ".xlsx", ".pptx",
-        ".doc",  ".xls",  ".ppt"
+        ".doc",  ".xls",  ".ppt",
+        ".eml"
     };
 
     public static int Main(string[] args)
@@ -76,6 +77,7 @@ public static class Program
         var docxConverter = new DocxToMarkdownConverter();
         var xlsxConverter = new XlsxToMarkdownConverter();
         var pptxConverter = new PptxToMarkdownConverter();
+        var emlConverter = new EmlToMarkdownConverter(pdfConverter, docxConverter, xlsxConverter, pptxConverter);
 
         int total = 0, converted = 0, skipped = 0, failed = 0;
 
@@ -105,7 +107,7 @@ public static class Program
             try
             {
                 Console.WriteLine($"[convert] {srcPath}");
-                ConvertOne(srcPath, mdPath, pdfConverter, docxConverter, xlsxConverter, pptxConverter);
+                ConvertOne(srcPath, mdPath, pdfConverter, docxConverter, xlsxConverter, pptxConverter, emlConverter);
                 converted++;
             }
             catch (Exception ex)
@@ -124,7 +126,8 @@ public static class Program
         PdfMarkdownConverter pdf,
         DocxToMarkdownConverter docx,
         XlsxToMarkdownConverter xlsx,
-        PptxToMarkdownConverter pptx)
+        PptxToMarkdownConverter pptx,
+        EmlToMarkdownConverter eml)
     {
         string ext = Path.GetExtension(srcPath).ToLowerInvariant();
 
@@ -136,12 +139,12 @@ public static class Program
             // <original>.ex via MarkdownOutput's displaySourcePath.
             using LegacyOfficeUpgrader.UpgradedFile upgraded = LegacyOfficeUpgrader.Upgrade(srcPath);
             string upgradedExt = Path.GetExtension(upgraded.Path).ToLowerInvariant();
-            IFileToMarkdownConverter inner = ConverterFor(upgradedExt, pdf, docx, xlsx, pptx);
+            IFileToMarkdownConverter inner = ConverterFor(upgradedExt, pdf, docx, xlsx, pptx, eml);
             inner.Convert(upgraded.Path, srcPath, mdPath);
             return;
         }
 
-        IFileToMarkdownConverter converter = ConverterFor(ext, pdf, docx, xlsx, pptx);
+        IFileToMarkdownConverter converter = ConverterFor(ext, pdf, docx, xlsx, pptx, eml);
         converter.Convert(srcPath, srcPath, mdPath);
     }
 
@@ -150,12 +153,14 @@ public static class Program
         PdfMarkdownConverter pdf,
         DocxToMarkdownConverter docx,
         XlsxToMarkdownConverter xlsx,
-        PptxToMarkdownConverter pptx) => ext switch
+        PptxToMarkdownConverter pptx,
+        EmlToMarkdownConverter eml) => ext switch
         {
             ".pdf" => pdf,
             ".docx" => docx,
             ".xlsx" => xlsx,
             ".pptx" => pptx,
+            ".eml" => eml,
             _ => throw new NotSupportedException($"No converter registered for extension '{ext}'.")
         };
 
@@ -256,6 +261,7 @@ public static class Program
         Console.WriteLine("  Word   (.docx, .doc)    direct OpenXml (modern); LibreOffice upgrade for legacy");
         Console.WriteLine("  Excel  (.xlsx, .xls)    direct OpenXml (modern); LibreOffice upgrade for legacy");
         Console.WriteLine("  PPoint (.pptx, .ppt)    direct OpenXml (modern); LibreOffice upgrade for legacy");
+        Console.WriteLine("  Email  (.eml)           RFC 5322 / MIME — HTML or text body + inlined attachments");
         Console.WriteLine();
         Console.WriteLine("Output: writes <name>.<ext>.md beside each source file, UTF-8 encoded.");
         Console.WriteLine("Source-newer rule: if source is more than 5 minutes newer than its .md, re-extract regardless of policy.");

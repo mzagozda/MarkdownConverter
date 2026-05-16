@@ -7,6 +7,7 @@ A .NET 9 console application that recursively converts PDF and Office documents 
 | `.pdf` | Text-layer extraction with geometry-aware region separation; OCR (`eng+pol`) fallback for scan-only pages. |
 | `.docx`, `.xlsx`, `.pptx` | Direct extraction from the OpenXml package — preserves headings, lists, tables, sheets, slide titles, bold/italic, hyperlinks, and speaker notes. |
 | `.doc`, `.xls`, `.ppt` | Legacy binary formats are upgraded to their modern XML equivalent in a temp directory via LibreOffice headless, then run through the OpenXml path. |
+| `.eml` | RFC 5322 / MIME messages parsed via MimeKit. Headers (From / To / Cc / Bcc / Date / Subject) become a bullet list; the HTML body (preferred) is converted to Markdown via ReverseMarkdown, otherwise the plain-text body is emitted as-is. Supported attachments (`.eml`, `.pdf`, `.docx`/`.doc`, `.xlsx`/`.xls`, `.pptx`/`.ppt`) are extracted to a temp dir, run through the matching converter, and inlined under an `## Attachment: <name>` heading. Nested `message/rfc822` parts and `.eml` attachments are handled recursively. |
 
 Each file is converted independently to a `<name>.<ext>.md` next to the source.
 
@@ -189,6 +190,15 @@ This is intentionally conservative — region detection is not always possible. 
 - XLSX merged cells are not detected — each underlying cell is emitted in its own column. Charts, conditional formatting, and pivot tables are ignored.
 - PPTX SmartArt, embedded charts, and master-slide content are not extracted. Only top-level shapes, tables in graphic frames, and speaker notes are.
 - Headers / footers from Word documents and slide-master content from PowerPoint are not extracted.
+
+**Email (`.eml`)**
+
+- Inline images (`cid:` references) inside an HTML body are kept as their original `<img>` tag text through ReverseMarkdown; the underlying image parts are not extracted.
+- S/MIME and PGP encrypted or signed parts are not decrypted — only the cleartext outer structure is read. Signature wrapper metadata is ignored.
+- DKIM / ARC headers and other technical headers are not emitted; only From / To / Cc / Bcc / Date / Subject are surfaced.
+- Attachments with extensions outside the supported set (`.eml`, `.pdf`, `.docx`, `.doc`, `.xlsx`, `.xls`, `.pptx`, `.ppt`) are listed by filename but their contents are not extracted. Images, archives (`.zip`, `.7z`), text/CSV, and other formats are not converted.
+- Nested `message/rfc822` and `.eml` attachments are followed recursively up to 8 levels deep; deeper nesting is truncated with a notice.
+- A failure converting any single attachment is logged to stderr and inlined as an error block under that attachment's heading — it never fails the parent `.eml.md` output.
 
 **Legacy binary formats**
 
